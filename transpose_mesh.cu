@@ -1,3 +1,4 @@
+#include <cooperative_groups.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <limits.h>
@@ -6,6 +7,8 @@
 
 #define DEBUG false
 #define NULL_DEFAULT -1
+
+namespace cg = cooperative_groups;
 
 __device__ int x[] = {0, -1, 0, 1};
 __device__ int y[] = {-1, 0, 1, 0};
@@ -74,28 +77,49 @@ __device__ bool isValid(int x, int y, int n) {
   return (0 <= x && x < n && 0 <= y && y < n);
 }
 
+__device__ unsigned int global_thread_counter = 0;
+
+// __device__ void LockBlocks(int max_active_threads) {
+//   atomicInc(&global_thread_counter, max_active_threads - 1);
+//   printf("((%d, %d), (%d, %d)) Total=(%d) Counter=%d\n", blockIdx.x,
+//   blockIdx.y,
+//          threadIdx.x, threadIdx.y, max_active_threads,
+//          global_thread_counter);
+//   while (global_thread_counter > 0);
+
+//   printf("((%d, %d), (%d, %d)) Total=(%d) Counter=%d FREEEEEE!\n",
+//   blockIdx.x, blockIdx.y,
+//          threadIdx.x, threadIdx.y, max_active_threads,
+//          global_thread_counter);
+// }
+
 __global__ void MeshTranspose(int *A, Data *B, Data *C, int n) {
   // printf("[thread (%d, %d)] Start.\n", threadIdx.x, threadIdx.y);
 
   int i = blockDim.x * blockIdx.x + threadIdx.x;
   int j = blockDim.y * blockIdx.y + threadIdx.y;
+  cg::grid_group grid = cg::this_grid();
+
+  bool not_ignore = (i < n && j < n);
+
+  int i_j = i * n + j;
+
+  if (not_ignore) {
+		MakeDataNull(B[i_j]);
+		MakeDataNull(C[i_j]);
 	
-	if(i >= n || j >= n) return;
-
-	int i_j = i * n + j;
-
-  MakeDataNull(B[i_j]);
-  MakeDataNull(C[i_j]);
-
-  // Step 1.1
-  if (1 <= i && i < n && 0 <= j && j < i) {
-    C[(i - 1) * n + j] = {A[i_j], j, i, false};
+		// Step 1.1
+		if (1 <= i && i < n && 0 <= j && j < i) {
+			C[(i - 1) * n + j] = {A[i_j], j, i, false};
+		}
+	
+		// Step 1.2
+		if (0 <= i && i < n - 1 && i < j && j < n) {
+			B[i * n + (j - 1)] = {A[i_j], j, i, false};
+		}
   }
 
-  // Step 1.2
-  if (0 <= i && i < n - 1 && i < j && j < n) {
-    B[i * n + (j - 1)] = {A[i_j], j, i, false};
-  }
+  cg::sync(grid);
 
   if (DEBUG)
     PrintDebugMatrix(A, B, C, n, 1.0f);
@@ -109,82 +133,100 @@ __global__ void MeshTranspose(int *A, Data *B, Data *C, int n) {
     Data *temp_B = new Data[4];
     Data *temp_C = new Data[4];
 
-    // Step 2.1
-    if (1 <= i && i < n && 0 <= j && j < i) {
-      // (a_km, m, k) is received from P(i + 1, j)
-      // send it to P(i - 1, j)
-      CopyData(temp_C[1], C[i_j]);
-      // (a_km, m, k) is received from P(i - 1, j)
-      if (B[i_j].m == i && B[i_j].k == j) {
-        // A(i, j) <- a_km {a_km has reached its destination}
-        temp_A = B[i_j].a_km;
-        got_A_from_B = true;
-      } else {
-        // Send (a_km, m, k) to P(i + 1, j)
-        CopyData(temp_B[3], B[i_j]);
+    cg::sync(grid);
+
+    if (not_ignore) {
+      // Step 2.1
+      if (1 <= i && i < n && 0 <= j && j < i) {
+        // (a_km, m, k) is received from P(i + 1, j)
+        // send it to P(i - 1, j)
+        CopyData(temp_C[1], C[i_j]);
+        // (a_km, m, k) is received from P(i - 1, j)
+        if (B[i_j].m == i && B[i_j].k == j) {
+          // A(i, j) <- a_km {a_km has reached its destination}
+          temp_A = B[i_j].a_km;
+          got_A_from_B = true;
+        } else {
+          // Send (a_km, m, k) to P(i + 1, j)
+          CopyData(temp_B[3], B[i_j]);
+        }
+      }
+
+      // Step 2.2
+      int i_i = i * n + i;
+      if (0 <= i && i < n && i == j) {
+        // (a_km, m, k) is received from P(i + 1, i)
+        // Send it to P(i, i + 1)
+        CopyData(temp_C[2], C[i_i]);
+
+        // (a_km, m, k) is received from P(i, i + 1)
+        // Send it to P(i + 1, i)
+        CopyData(temp_B[3], B[i_i]);
+      }
+
+      // Step 2.3
+      if (0 <= i && i < n - 1 && i < j && j < n) {
+        // (a_km, m, k) is received from P(i, j + 1)
+        // send it to P(i, j - 1)
+        CopyData(temp_B[0], B[i_j]);
+        // (a_km, m, k) is received from P(i, j - 1)
+        if (C[i_j].m == i && C[i_j].k == j) {
+          // A(i, j) <- a_km {a_km has reached its destination}
+          temp_A = C[i_j].a_km;
+          got_A_from_B = false;
+        } else {
+          // Send (a_km, m, k) to P(i, j + 1)
+          CopyData(temp_C[2], C[i_j]);
+        }
       }
     }
 
-    // Step 2.2
-    int i_i = i * n + i;
-    if (0 <= i && i < n && i == j) {
-      // (a_km, m, k) is received from P(i + 1, i)
-      // Send it to P(i, i + 1)
-      CopyData(temp_C[2], C[i_i]);
+    // __syncthreads();
+    // LockBlocks(n * n);
+    cg::sync(grid);
 
-      // (a_km, m, k) is received from P(i, i + 1)
-      // Send it to P(i + 1, i)
-      CopyData(temp_B[3], B[i_i]);
-    }
+    if (not_ignore) {
+      // Copy the final state values now
+      // Below section only deals with writing of data
+      if (temp_A != NULL_DEFAULT) {
+        A[i_j] = temp_A;
+        if (got_A_from_B)
+          MakeDataNull(B[i_j]);
+        else
+          MakeDataNull(C[i_j]);
+			}
+		}
+		
+		cg::sync(grid);
 
-    // Step 2.3
-    if (0 <= i && i < n - 1 && i < j && j < n) {
-      // (a_km, m, k) is received from P(i, j + 1)
-      // send it to P(i, j - 1)
-      CopyData(temp_B[0], B[i_j]);
-      // (a_km, m, k) is received from P(i, j - 1)
-      if (C[i_j].m == i && C[i_j].k == j) {
-        // A(i, j) <- a_km {a_km has reached its destination}
-        temp_A = C[i_j].a_km;
-        got_A_from_B = false;
-      } else {
-        // Send (a_km, m, k) to P(i, j + 1)
-        CopyData(temp_C[2], C[i_j]);
+		if(not_ignore) {
+      for (int next = 0; next < 4; ++next) {
+        int new_x = i + x[next];
+        int new_y = j + y[next];
+        int idx = new_x * n + new_y;
+        if (isValid(new_x, new_y, n)) {
+          if (temp_B[next].isNull == false) {
+            CopyData(B[idx], temp_B[next]);
+          }
+          if (temp_C[next].isNull == false) {
+            CopyData(C[idx], temp_C[next]);
+          }
+        }
       }
     }
 
-		__syncthreads();
-    // Copy the final state values now
-    // Below section only deals with writing of data
-    if (temp_A != NULL_DEFAULT) {
-      A[i_j] = temp_A;
-      if (got_A_from_B)
-        MakeDataNull(B[i_j]);
-      else
+    cg::sync(grid);
+
+    if (not_ignore) {
+      // Now make null for the last row in C 2D-Array
+      if (i == n - 1) {
         MakeDataNull(C[i_j]);
-    }
-    for (int next = 0; next < 4; ++next) {
-      int new_x = i + x[next];
-      int new_y = j + y[next];
-      int idx = new_x * n + new_y;
-      if (isValid(new_x, new_y, n)) {
-        if (temp_B[next].isNull == false) {
-          CopyData(B[idx], temp_B[next]);
-        }
-        if (temp_C[next].isNull == false) {
-          CopyData(C[idx], temp_C[next]);
-        }
       }
-    }
 
-    // Now make null for the last row in C 2D-Array
-    if (i == n - 1) {
-      MakeDataNull(C[i_j]);
-    }
-
-    // Now make null for the last column in B 2D-Array
-    if (j == n - 1) {
-      MakeDataNull(B[i_j]);
+      // Now make null for the last column in B 2D-Array
+      if (j == n - 1) {
+        MakeDataNull(B[i_j]);
+      }
     }
 
     if (DEBUG)
@@ -192,8 +234,30 @@ __global__ void MeshTranspose(int *A, Data *B, Data *C, int n) {
   }
 }
 
+void TestOutput(int *Mat, int n) {
+  printf("\n\nSTARTING TESTING\n\n");
+  bool ok = true;
+  int val = 0;
+  for (int j = 0; j < n; ++j) {
+    for (int i = 0; i < n; ++i) {
+      if (Mat[i * n + j] != (++val)) {
+        ok = false;
+        printf("Fault at: (%d, %d) Expected: %d, Found %d\n", i, j, val,
+               Mat[i * n + j]);
+      }
+    }
+  }
+
+  if (ok)
+    printf("Test: OK\n");
+  else {
+    printf("Test: FAIL\n");
+    PrintMatrix(Mat, n, 1);
+  }
+}
+
 int main() {
-  int n = 20;
+  int n = 10;
   printf("n=%d\n", n);
 
   int *Mat = new int[n * n];
@@ -211,14 +275,24 @@ int main() {
   cudaMalloc((void **)&d_C, sizeof(Data) * (n * n));
   cudaMemcpy(d_A, Mat, sizeof(int) * (n * n), cudaMemcpyHostToDevice);
 
-  dim3 block_size(32, 32);
-  dim3 grid_size(1);
+  int num_threads = n * n;
+  int block_val = min(n, 32);
+  int grid_val = ceil(n / (float)block_val);
+  printf("Block size: %d * %d\n", block_val, block_val);
+	printf("Grid size: %d * %d\n", grid_val, grid_val);
+	printf("Threads launched: (Expected/Actual) = (%d, %d)\n", num_threads, block_val * block_val * grid_val * grid_val);
+  dim3 blockDim(block_val, block_val);
+  dim3 gridDim(grid_val, grid_val);
+  void *kernelArgs[] = {(void *)&d_A, (void *)&d_B, (void *)&d_C, (void *)&n};
 
   if (DEBUG)
     PrintMatrix(Mat, n, 0);
 
   clock_t time_taken = clock();
-  MeshTranspose<<<grid_size, block_size>>>(d_A, d_B, d_C, n);
+
+  // MeshTranspose<<<gridDim, blockDim>>>(d_A, d_B, d_C, n);
+  cudaLaunchCooperativeKernel((void *)MeshTranspose, gridDim, blockDim,
+                              kernelArgs);
   cudaMemcpy(Mat, d_A, sizeof(int) * (n * n), cudaMemcpyDeviceToHost);
   time_taken = clock() - time_taken;
 
@@ -228,22 +302,8 @@ int main() {
     PrintMatrix(Mat, n, 1);
   printf("Time taken: %f ms\n", 1000 * ((float)time_taken / CLOCKS_PER_SEC));
 
-	// Testing if output is correct!
-	bool ok = true;
-	val = 0;
-	for(int j = 0; j < n; ++j) {
-		for(int i = 0; i < n; ++i) {
-       if(Mat[i *n + j] != (++val)) {
-				 ok = false;
-			 }
-		}
-	}
-
-	if(ok) printf("Test: OK\n");
-	else {
-		printf("Test: FAIL\n");
-    PrintMatrix(Mat, n, 1);
-	}
+  // Testing if output is correct!
+  TestOutput(Mat, n);
 
   cudaFree(d_A);
   cudaFree(d_B);
